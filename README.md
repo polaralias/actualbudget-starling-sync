@@ -1,1 +1,15 @@
 # actualbudget-starling-sync
+
+Create env with:
+PORT=5007
+ACTUAL_SERVER_URL=http://actual:5006
+ACTUAL_PASSWORD=
+ACTUAL_BUDGET_ID=
+HA_BASE_URL=
+HA_TOKEN=
+ACCOUNT_MAP_JSON={"{starlingID}":{"actualAccountId":"{actualID}","currency":"GBP"}}
+
+ALERT_TIMES=08:00,20:00
+ALERT_THRESHOLD_PCT=0.9
+ALERT_INCLUDE_ZERO=true
+ALERT_MONTHLY_SUMMARY_TIME=09:00
