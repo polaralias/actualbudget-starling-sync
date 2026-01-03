@@ -14,13 +14,20 @@ const ACTUAL_PASSWORD = process.env.ACTUAL_PASSWORD || "";
 const ACTUAL_BUDGET_ID = process.env.ACTUAL_BUDGET_ID;
 const HA_BASE_URL = process.env.HA_BASE_URL || "";
 const HA_TOKEN = process.env.HA_TOKEN || "";
-const ACCOUNT_MAP = JSON.parse(process.env.ACCOUNT_MAP_JSON || "{}");
 const STARLING_WEBHOOK_SHARED_SECRET = process.env.STARLING_WEBHOOK_SHARED_SECRET || "";
 
 const ALERT_TIMES = (process.env.ALERT_TIMES || "09:00").split(",").map(s => s.trim());
 const ALERT_THRESHOLD_PCT = Number(process.env.ALERT_THRESHOLD_PCT || "0.9");
 const ALERT_INCLUDE_ZERO = String(process.env.ALERT_INCLUDE_ZERO || "true").toLowerCase() === "true";
 const ALERT_MONTHLY_SUMMARY_TIME = process.env.ALERT_MONTHLY_SUMMARY_TIME || "09:00";
+
+let ACCOUNT_MAP = {};
+try {
+  ACCOUNT_MAP = JSON.parse(process.env.ACCOUNT_MAP_JSON || "{}");
+} catch (e) {
+  console.error("FATAL: Failed to parse ACCOUNT_MAP_JSON. Check your environment variables.");
+  process.exit(1);
+}
 
 let initPromise = null;
 
@@ -73,11 +80,15 @@ function starlingToActualTx(feedItem, actualAccountId) {
 
 async function notifyHA(title, message, data = {}) {
   if (!HA_BASE_URL || !HA_TOKEN) return;
-  await axios.post(
-    `${HA_BASE_URL}/api/services/notify/notify`,
-    { title, message, data },
-    { headers: { Authorization: `Bearer ${HA_TOKEN}` } }
-  );
+  try {
+    await axios.post(
+      `${HA_BASE_URL}/api/services/notify/notify`,
+      { title, message, data },
+      { headers: { Authorization: `Bearer ${HA_TOKEN}` } }
+    );
+  } catch (e) {
+    console.error("Failed to send HA notification", e.message);
+  }
 }
 
 async function handleEvent(ev) {
@@ -96,6 +107,10 @@ async function handleEvent(ev) {
   const tx = starlingToActualTx(item, map.actualAccountId);
   const result = await actual.importTransactions(map.actualAccountId, [tx]);
   console.log("import result", result);
+
+  // CRITICAL: Sync after import to persist changes
+  await actual.syncBudget();
+
   if ((result.added && result.added.length) || (result.updated && result.updated.length)) {
     const amt = (tx.amount / 100).toFixed(2);
     await notifyHA("Actual updated from Starling", `${tx.date} ${tx.payee_name} £${amt}`, {
@@ -110,23 +125,28 @@ async function runBudgetAlerts(forMonthIso) {
   const isoMonth = forMonthIso || new Date().toISOString().slice(0, 7);
   const cats = await actual.getCategories();
   const month = await actual.getBudgetMonth(isoMonth);
+  if (!month) return;
+
   const rows = cats.map(c => {
     const m = month.categories.find(x => x.id === c.id);
     const budgeted = m?.budgeted || 0;
+    // Actual API returns spent as negative for spending
     const spent = m?.spent || 0;
-    const available = budgeted - spent;
-    const ratio = budgeted > 0 ? spent / budgeted : spent > 0 ? Infinity : 0;
+    const available = budgeted + spent; // Corrected sign (budgeted is +, spent is -)
+    const ratio = budgeted > 0 ? (Math.abs(spent) / budgeted) : (spent < 0 ? Infinity : 0);
     return { name: c.name, budgeted, spent, available, ratio };
   });
+
   const overspent = rows.filter(r => r.available < 0);
   const nearLimit = rows.filter(r => r.available >= 0 && r.ratio >= ALERT_THRESHOLD_PCT && isFinite(r.ratio));
-  const zeroBudgetSpent = ALERT_INCLUDE_ZERO ? rows.filter(r => r.budgeted === 0 && r.spent > 0) : [];
+  const zeroBudgetSpent = ALERT_INCLUDE_ZERO ? rows.filter(r => r.budgeted === 0 && r.spent < 0) : [];
   const parts = [];
+
   if (overspent.length) {
     parts.push(
       "Overspent: " +
         overspent
-          .map(r => `${r.name} £${(r.spent / 100).toFixed(2)}/£${(r.budgeted / 100).toFixed(2)}`)
+          .map(r => `${r.name} £${(Math.abs(r.spent) / 100).toFixed(2)}/£${(r.budgeted / 100).toFixed(2)}`)
           .join(", ")
     );
   }
@@ -134,14 +154,14 @@ async function runBudgetAlerts(forMonthIso) {
     parts.push(
       "Near limit: " +
         nearLimit
-          .map(r => `${r.name} £${(r.spent / 100).toFixed(2)}/£${(r.budgeted / 100).toFixed(2)}`)
+          .map(r => `${r.name} £${(Math.abs(r.spent) / 100).toFixed(2)}/£${(r.budgeted / 100).toFixed(2)}`)
           .join(", ")
     );
   }
   if (zeroBudgetSpent.length) {
     parts.push(
       "Unbudgeted spend: " +
-        zeroBudgetSpent.map(r => `${r.name} £${(r.spent / 100).toFixed(2)}`).join(", ")
+        zeroBudgetSpent.map(r => `${r.name} £${(Math.abs(r.spent) / 100).toFixed(2)}`).join(", ")
     );
   }
   if (parts.length) {
@@ -153,12 +173,15 @@ async function runMonthlySummary() {
   if (!(await initActual())) return;
   const isoMonth = new Date().toISOString().slice(0, 7);
   const month = await actual.getBudgetMonth(isoMonth);
+  if (!month) return;
+
   const totalBudgeted = month.categories.reduce((s, x) => s + (x.budgeted || 0), 0);
   const totalSpent = month.categories.reduce((s, x) => s + (x.spent || 0), 0);
-  const available = totalBudgeted - totalSpent;
+  const available = totalBudgeted + totalSpent; // Corrected sign
+
   await notifyHA(
     `Monthly budget ${isoMonth}`,
-    `Budgeted £${(totalBudgeted / 100).toFixed(2)}, spent £${(totalSpent / 100).toFixed(2)}, available £${(available / 100).toFixed(2)}`,
+    `Budgeted £${(totalBudgeted / 100).toFixed(2)}, spent £${(Math.abs(totalSpent) / 100).toFixed(2)}, available £${(available / 100).toFixed(2)}`,
     { group: "actual_budget" }
   );
 }
@@ -167,78 +190,32 @@ app.get("/starling-sync-health", (_req, res) => {
   res.status(200).send("ok");
 });
 
-app.post("/starling-sync-echo", async (req, res) => {
-  try {
-    const raw = await getRawBody(req);
-    const text = raw.toString("utf8");
-    res.set("content-type", "application/json").status(200).send(text);
-  } catch {
-    res.status(400).send("bad");
-  }
-});
-
-app.get("/starling-sync-debug-actual", async (_req, res) => {
-  try {
-    if (!(await initActual())) {
-      return res.status(500).json({ ok: false, error: "initActual failed (see logs)" });
-    }
-    const accounts = await actual.getAccounts();
-    res.json({ ok: true, count: accounts.length, accounts: accounts.map(a => ({ id: a.id, name: a.name })) });
-  } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: e?.message || String(e),
-      stack: e?.stack || null
-    });
-  }
-});
-
-app.get("/starling-sync-debug-budgets", async (_req, res) => {
-  try {
-    const ok = await initActual();
-    if (!ok) return res.status(500).json({ ok: false, error: "initActual failed (see logs)" });
-
-    const budgets = await actual.getBudgets();
-    res.json({
-      ok: true,
-      budgets: budgets.map(b => ({
-        id: b.id,
-        name: b.name,
-        state: b.state
-      }))
-    });
-  } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: e?.message || String(e),
-      stack: e?.stack || null
-    });
-  }
-});
-
-app.get("/starling-sync-debug-env", (_req, res) => {
-  const { ACTUAL_PASSWORD, HA_TOKEN, STARLING_WEBHOOK_SHARED_SECRET, ...rest } = process.env;
-  res.json(rest);
-});
-
-app.post("/starling-sync-incoming-jw", async (req, res) => {
+app.post("/starling-sync-incoming", async (req, res) => {
   try {
     const raw = await getRawBody(req);
     const sig = req.header("X-Hook-Signature") || "";
+
     if (STARLING_WEBHOOK_SHARED_SECRET) {
-      const h = crypto.createHmac("sha256", STARLING_WEBHOOK_SHARED_SECRET).update(raw).digest("base64");
-      if (h !== sig) {
+      // Use SHA-512 as per Starling documentation for Payment Services
+      const h = crypto.createHmac("sha512", STARLING_WEBHOOK_SHARED_SECRET).update(raw).digest("base64");
+      
+      // Use timingSafeEqual to prevent timing attacks
+      const hBuf = Buffer.from(h, "utf8");
+      const sigBuf = Buffer.from(sig, "utf8");
+      
+      if (hBuf.length !== sigBuf.length || !crypto.timingSafeEqual(hBuf, sigBuf)) {
         console.log("signature mismatch");
         return res.status(401).send("invalid signature");
       }
     }
+
     const body = JSON.parse(raw.toString("utf8"));
     res.status(200).send("ok");
     console.log("webhook received");
     try {
       await handleEvent(body);
     } catch (e) {
-      console.log("webhook error", e);
+      console.log("webhook processing error", e);
     }
   } catch (e) {
     console.log("webhook parse error", e);
@@ -246,7 +223,7 @@ app.post("/starling-sync-incoming-jw", async (req, res) => {
   }
 });
 
-app.post("/starling-sync-run-budget-alerts", async (_req, res) => {
+app.post("/starling-sync-run-alerts", async (_req, res) => {
   try {
     await runBudgetAlerts();
     res.status(200).send("ok");
@@ -274,6 +251,25 @@ scheduleAt(ALERT_MONTHLY_SUMMARY_TIME, () => {
   }
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`sync listening on ${PORT}`);
 });
+
+async function shutdown() {
+  console.log("Shutting down gracefully...");
+  try {
+    await actual.shutdown();
+    console.log("Actual API shut down.");
+  } catch (e) {
+    console.error("Error during Actual shutdown", e);
+  }
+  server.close(() => {
+    console.log("HTTP server closed.");
+    process.exit(0);
+  });
+  // Force exit after 10s if logic gets stuck
+  setTimeout(() => process.exit(1), 10000);
+}
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
