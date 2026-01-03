@@ -22,27 +22,27 @@ const ALERT_THRESHOLD_PCT = Number(process.env.ALERT_THRESHOLD_PCT || "0.9");
 const ALERT_INCLUDE_ZERO = String(process.env.ALERT_INCLUDE_ZERO || "true").toLowerCase() === "true";
 const ALERT_MONTHLY_SUMMARY_TIME = process.env.ALERT_MONTHLY_SUMMARY_TIME || "09:00";
 
-let actualInitialised = false;
-let actualBudgetLoaded = false;
+let initPromise = null;
 
 async function initActual() {
-  try {
-    if (!actualInitialised) {
-      await actual.init({
-        serverURL: ACTUAL_SERVER_URL,
-        password: ACTUAL_PASSWORD
-      });
-      actualInitialised = true;
-    }
-    if (!actualBudgetLoaded) {
-      await actual.downloadBudget(ACTUAL_BUDGET_ID);
-      actualBudgetLoaded = true;
-    }
+  if (initPromise) return initPromise;
+
+  initPromise = (async () => {
+    await actual.init({
+      dataDir: "/tmp/actual-cache",
+      serverURL: ACTUAL_SERVER_URL,
+      password: ACTUAL_PASSWORD
+    });
+
+    await actual.downloadBudget(ACTUAL_BUDGET_ID);
     return true;
-  } catch (e) {
-    console.error("Actual init/download failed", e);
+  })().catch(e => {
+    console.error("Actual init/download failed", e?.stack || e);
+    initPromise = null;
     return false;
-  }
+  });
+
+  return initPromise;
 }
 
 function toMinor(amountCurrency) {
@@ -180,12 +180,39 @@ app.post("/starling-sync-echo", async (req, res) => {
 app.get("/starling-sync-debug-actual", async (_req, res) => {
   try {
     if (!(await initActual())) {
-      return res.status(500).json({ ok: false, error: "init failed" });
+      return res.status(500).json({ ok: false, error: "initActual failed (see logs)" });
     }
     const accounts = await actual.getAccounts();
     res.json({ ok: true, count: accounts.length, accounts: accounts.map(a => ({ id: a.id, name: a.name })) });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    res.status(500).json({
+      ok: false,
+      error: e?.message || String(e),
+      stack: e?.stack || null
+    });
+  }
+});
+
+app.get("/starling-sync-debug-budgets", async (_req, res) => {
+  try {
+    const ok = await initActual();
+    if (!ok) return res.status(500).json({ ok: false, error: "initActual failed (see logs)" });
+
+    const budgets = await actual.getBudgets();
+    res.json({
+      ok: true,
+      budgets: budgets.map(b => ({
+        id: b.id,
+        name: b.name,
+        state: b.state
+      }))
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: e?.message || String(e),
+      stack: e?.stack || null
+    });
   }
 });
 
