@@ -4,6 +4,7 @@ import axios from "axios";
 import * as actual from "@actual-app/api";
 import crypto from "crypto";
 import cron from "node-cron";
+import fs from "fs";
 
 const app = express();
 app.disable("x-powered-by");
@@ -35,8 +36,14 @@ async function initActual() {
   if (initPromise) return initPromise;
 
   initPromise = (async () => {
+    const dataDir = "/tmp/actual-cache";
+    if (!fs.existsSync(dataDir)) {
+      console.log("Creating directory", dataDir);
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+
     await actual.init({
-      dataDir: "/tmp/actual-cache",
+      dataDir,
       serverURL: ACTUAL_SERVER_URL,
       password: ACTUAL_PASSWORD
     });
@@ -145,23 +152,23 @@ async function runBudgetAlerts(forMonthIso) {
   if (overspent.length) {
     parts.push(
       "Overspent: " +
-        overspent
-          .map(r => `${r.name} £${(Math.abs(r.spent) / 100).toFixed(2)}/£${(r.budgeted / 100).toFixed(2)}`)
-          .join(", ")
+      overspent
+        .map(r => `${r.name} £${(Math.abs(r.spent) / 100).toFixed(2)}/£${(r.budgeted / 100).toFixed(2)}`)
+        .join(", ")
     );
   }
   if (nearLimit.length) {
     parts.push(
       "Near limit: " +
-        nearLimit
-          .map(r => `${r.name} £${(Math.abs(r.spent) / 100).toFixed(2)}/£${(r.budgeted / 100).toFixed(2)}`)
-          .join(", ")
+      nearLimit
+        .map(r => `${r.name} £${(Math.abs(r.spent) / 100).toFixed(2)}/£${(r.budgeted / 100).toFixed(2)}`)
+        .join(", ")
     );
   }
   if (zeroBudgetSpent.length) {
     parts.push(
       "Unbudgeted spend: " +
-        zeroBudgetSpent.map(r => `${r.name} £${(Math.abs(r.spent) / 100).toFixed(2)}`).join(", ")
+      zeroBudgetSpent.map(r => `${r.name} £${(Math.abs(r.spent) / 100).toFixed(2)}`).join(", ")
     );
   }
   if (parts.length) {
@@ -190,7 +197,7 @@ app.get("/starling-sync-health", (_req, res) => {
   res.status(200).send("ok");
 });
 
-app.post("/starling-sync-incoming", async (req, res) => {
+app.post("/starling-sync-incoming-jw", async (req, res) => {
   try {
     const raw = await getRawBody(req);
     const sig = req.header("X-Hook-Signature") || "";
@@ -198,11 +205,11 @@ app.post("/starling-sync-incoming", async (req, res) => {
     if (STARLING_WEBHOOK_SHARED_SECRET) {
       // Use SHA-512 as per Starling documentation for Payment Services
       const h = crypto.createHmac("sha512", STARLING_WEBHOOK_SHARED_SECRET).update(raw).digest("base64");
-      
+
       // Use timingSafeEqual to prevent timing attacks
       const hBuf = Buffer.from(h, "utf8");
       const sigBuf = Buffer.from(sig, "utf8");
-      
+
       if (hBuf.length !== sigBuf.length || !crypto.timingSafeEqual(hBuf, sigBuf)) {
         console.log("signature mismatch");
         return res.status(401).send("invalid signature");
@@ -240,14 +247,14 @@ function scheduleAt(hhmm, fn) {
 
 for (const t of ALERT_TIMES) {
   scheduleAt(t, () => {
-    runBudgetAlerts().catch(() => {});
+    runBudgetAlerts().catch(() => { });
   });
 }
 
 scheduleAt(ALERT_MONTHLY_SUMMARY_TIME, () => {
   const d = new Date();
   if (d.getDate() === 1) {
-    runMonthlySummary().catch(() => {});
+    runMonthlySummary().catch(() => { });
   }
 });
 
